@@ -28,3 +28,22 @@
     color: var(--SmartThemeEmColor, #e0a070);
     opacity: 1;
 }
+
+.sillydroid-screen-awake-diagnostics {
+    margin: 0.5em 0;
+    font-size: 0.8em;
+    line-height: 1.45;
+    opacity: 0.6;
+}
+
+/* 视频保活用的播放器：2×2 像素、近乎全透明，不遮挡界面也不接收点击 */
+.sillydroid-screen-awake-keepalive {
+    position: fixed;
+    left: 0;
+    bottom: 0;
+    width: 2px;
+    height: 2px;
+    opacity: 0.01;
+    pointer-events: none;
+    z-index: 2147483647;
+}

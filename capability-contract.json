@@ -17,7 +17,14 @@
       "owner": "provider",
       "symbol": "navigator.wakeLock.request('screen')",
       "required": false,
-      "fallback": "显示当前浏览器不支持或无法申请屏幕唤醒锁，常亮保持关闭。"
+      "fallback": "视频保活接管：插入静音循环视频维持亮屏。"
+    },
+    {
+      "id": "keep-awake-video",
+      "owner": "provider",
+      "symbol": "HTMLCanvasElement.captureStream + MediaRecorder",
+      "required": false,
+      "fallback": "显示当前环境无法保持屏幕常亮，屏幕仍按系统设置关闭。"
     }
   ]
 }
