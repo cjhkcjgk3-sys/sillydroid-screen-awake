@@ -47,3 +47,47 @@
     pointer-events: none;
     z-index: 2147483647;
 }
+
+.sillydroid-screen-awake-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6em;
+    margin: 0.4em 0;
+    flex-wrap: wrap;
+}
+
+.sillydroid-screen-awake-row label {
+    flex: 0 0 auto;
+    font-size: 0.9em;
+    opacity: 0.9;
+}
+
+.sillydroid-screen-awake-row input[type='range'] {
+    flex: 1 1 8em;
+    min-width: 6em;
+}
+
+.sillydroid-screen-awake-row input[type='number'] {
+    width: 5.5em;
+}
+
+.sillydroid-screen-awake-row output {
+    min-width: 2.6em;
+    font-size: 0.85em;
+    opacity: 0.75;
+    text-align: right;
+}
+
+.sillydroid-screen-awake-status[data-state='idle'] {
+    color: var(--SmartThemeEmColor, #e0a070);
+    opacity: 1;
+}
+
+/* 页面压暗层：只降低发光，不拦截点击（放在视频保活层之下） */
+.sillydroid-screen-awake-dim {
+    position: fixed;
+    inset: 0;
+    background: #000;
+    pointer-events: none;
+    z-index: 2147483646;
+}

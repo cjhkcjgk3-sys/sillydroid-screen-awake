@@ -25,6 +25,13 @@
       "symbol": "HTMLCanvasElement.captureStream + MediaRecorder",
       "required": false,
       "fallback": "显示当前环境无法保持屏幕常亮，屏幕仍按系统设置关闭。"
+    },
+    {
+      "id": "novel-task-signal",
+      "owner": "plugin",
+      "symbol": "#nag-status.running (Novel-Auto-Generator)",
+      "required": false,
+      "fallback": "联动失效时按普通空闲策略计时；该插件也可改用 globalThis.SillyDroidScreenAwake.hold/release 显式联动。"
     }
   ]
 }

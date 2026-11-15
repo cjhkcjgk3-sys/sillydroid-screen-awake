@@ -3,11 +3,29 @@ const panelId = 'sillydroid-screen-awake-panel';
 const checkboxId = 'sillydroid-screen-awake-enabled';
 const statusId = 'sillydroid-screen-awake-status';
 const diagnosticsId = 'sillydroid-screen-awake-diagnostics';
-const defaults = { enabled: false };
+const dimId = 'sillydroid-screen-awake-dim';
+const dimSliderId = 'sillydroid-screen-awake-dim-slider';
+const dimValueId = 'sillydroid-screen-awake-dim-value';
+const idleInputId = 'sillydroid-screen-awake-idle';
+const guardCheckboxId = 'sillydroid-screen-awake-guard';
+
+const defaults = {
+    enabled: false,
+    dimLevel: 0,
+    idleTimeoutMinutes: 10,
+    guardNovelTask: true,
+};
 
 const MODE_NONE = 'none';
 const MODE_WAKE_LOCK = 'wakelock';
 const MODE_VIDEO = 'video';
+
+// 小说自动生成器（Novel-Auto-Generator）把运行状态渲染在这个徽章上。
+const NOVEL_STATUS_ELEMENT_ID = 'nag-status';
+const TASK_POLL_INTERVAL_MS = 2000;
+const TASK_END_GRACE_MS = 60000;
+const MAX_DIM_PERCENT = 80;
+const MAX_IDLE_MINUTES = 600;
 
 let wakeLockSentinel = null;
 let wakeLockRequest = null;
@@ -16,6 +34,7 @@ let mountObserver = null;
 let visibilityChangeHandler = null;
 let pageHideHandler = null;
 let pageShowHandler = null;
+let activityHandlers = null;
 let activeSettings = null;
 let activeMode = MODE_NONE;
 let retryTimer = null;
@@ -24,6 +43,15 @@ let mountErrorLogged = false;
 let keepAwakeVideo = null;
 let keepAwakeVideoRequest = null;
 let keepAwakeClipUrl = null;
+let dimOverlay = null;
+let idleTimer = null;
+let taskPollTimer = null;
+let lastActivityAt = Date.now();
+let asleep = false;
+let novelTaskRunning = false;
+let generationBound = false;
+let publicApiInstalled = false;
+const holds = new Set();
 const maxRetryDelay = 60000;
 
 function getExtensionSettings() {
@@ -75,6 +103,279 @@ function isVideoFallbackSupported() {
         && typeof HTMLCanvasElement.prototype.captureStream === 'function';
 }
 
+// ---------------------------------------------------------------------------
+// 功耗：页面压暗（黑层叠加，只降低发光、不拦截点击）
+// ---------------------------------------------------------------------------
+
+function clampDim(level) {
+    const value = Number(level);
+    if (!Number.isFinite(value)) {
+        return 0;
+    }
+    return Math.min(MAX_DIM_PERCENT, Math.max(0, Math.round(value)));
+}
+
+function applyDim(level) {
+    const percent = clampDim(level);
+
+    if (!document.body) {
+        return;
+    }
+
+    if (!dimOverlay) {
+        dimOverlay = document.createElement('div');
+        dimOverlay.id = dimId;
+        dimOverlay.className = 'sillydroid-screen-awake-dim';
+        dimOverlay.setAttribute('aria-hidden', 'true');
+        document.body.append(dimOverlay);
+    }
+
+    dimOverlay.style.opacity = String(percent / 100);
+    dimOverlay.style.display = percent > 0 ? 'block' : 'none';
+
+    const label = document.getElementById(dimValueId);
+    if (label) {
+        label.textContent = `${percent}%`;
+    }
+}
+
+function removeDim() {
+    if (dimOverlay) {
+        dimOverlay.remove();
+        dimOverlay = null;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 任务守护：小说自动生成器 / 酒馆生成中
+// ---------------------------------------------------------------------------
+
+function isNovelTaskRunning() {
+    const node = document.getElementById(NOVEL_STATUS_ELEMENT_ID);
+    if (!node?.classList || typeof node.classList.contains !== 'function') {
+        return false;
+    }
+
+    return node.classList.contains('running');
+}
+
+function hasHeldWork() {
+    return holds.size > 0;
+}
+
+function clearIdleTimer() {
+    if (idleTimer !== null) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+    }
+}
+
+function addHold(reason) {
+    if (!extensionActive) {
+        return;
+    }
+
+    holds.add(reason);
+    clearIdleTimer();
+}
+
+function removeHold(reason) {
+    holds.delete(reason);
+}
+
+function formatMinutes(minutes) {
+    const value = Number(minutes);
+    if (!Number.isFinite(value) || value <= 0) {
+        return '自定义时长';
+    }
+    if (value < 1) {
+        return `${Math.max(1, Math.round(value * 60))} 秒`;
+    }
+    return `${value} 分钟`;
+}
+
+function sleepNow(reason) {
+    if (!extensionActive) {
+        return;
+    }
+
+    asleep = true;
+    clearIdleTimer();
+    pauseKeepAwakeVideo();
+    void releaseWakeLock();
+    setMode(MODE_NONE);
+
+    if (reason === 'task-ended') {
+        setStatus('小说生成任务已结束，已自动释放唤醒锁。触摸屏幕或按键会重新保持常亮。', 'idle');
+    } else {
+        setStatus(`已休眠：${formatMinutes(activeSettings?.idleTimeoutMinutes)}无操作，屏幕可以自动关闭了。触摸屏幕会重新保持常亮。`, 'idle');
+    }
+}
+
+function armIdleTimer() {
+    clearIdleTimer();
+
+    if (!extensionActive || !activeSettings?.enabled || asleep || hasHeldWork()) {
+        return;
+    }
+
+    const minutes = Number(activeSettings.idleTimeoutMinutes);
+    if (!Number.isFinite(minutes) || minutes <= 0) {
+        return;
+    }
+
+    idleTimer = setTimeout(() => {
+        idleTimer = null;
+        if (!extensionActive || !activeSettings?.enabled || asleep) {
+            return;
+        }
+        if (hasHeldWork()) {
+            return;
+        }
+        sleepNow('idle');
+    }, minutes * 60000);
+}
+
+function noteActivity() {
+    lastActivityAt = Date.now();
+
+    if (asleep) {
+        asleep = false;
+        if (extensionActive && activeSettings?.enabled) {
+            void engage(activeSettings);
+        }
+        return;
+    }
+
+    armIdleTimer();
+}
+
+function startNovelTaskPolling() {
+    if (taskPollTimer !== null) {
+        return;
+    }
+
+    taskPollTimer = setInterval(() => {
+        if (!extensionActive) {
+            return;
+        }
+        pollNovelTask();
+    }, TASK_POLL_INTERVAL_MS);
+
+    pollNovelTask();
+}
+
+function stopNovelTaskPolling() {
+    if (taskPollTimer !== null) {
+        clearInterval(taskPollTimer);
+        taskPollTimer = null;
+    }
+}
+
+function pollNovelTask() {
+    const settings = activeSettings;
+    if (!settings) {
+        return;
+    }
+
+    const guarded = settings.guardNovelTask !== false;
+    const running = guarded && isNovelTaskRunning();
+
+    if (running === novelTaskRunning) {
+        return;
+    }
+
+    novelTaskRunning = running;
+
+    if (running) {
+        asleep = false;
+        addHold('novel-task');
+        noteActivity();
+        if (activeSettings?.enabled) {
+            void engage(activeSettings);
+        }
+        setStatus('屏幕常亮已开启 · 正在守护小说生成任务（任务结束前不会自动放开）。', 'active');
+        renderDiagnostics();
+        return;
+    }
+
+    removeHold('novel-task');
+
+    if (!extensionActive) {
+        return;
+    }
+
+    if (!activeSettings?.enabled) {
+        return;
+    }
+
+    if (Date.now() - lastActivityAt > TASK_END_GRACE_MS) {
+        sleepNow('task-ended');
+    } else {
+        armIdleTimer();
+        setStatus(`小说生成任务已结束，屏幕常亮仍开启（${formatMinutes(activeSettings.idleTimeoutMinutes)}无操作后自动放开）。`, 'active');
+    }
+
+    renderDiagnostics();
+}
+
+function bindGenerationEvents() {
+    if (generationBound) {
+        return;
+    }
+
+    const context = globalThis.SillyTavern?.getContext?.();
+    const eventSource = context?.eventSource;
+    if (!eventSource || typeof eventSource.on !== 'function') {
+        return;
+    }
+
+    // 酒馆自身生成期间也视为「有活要干」：否则把自定义时长设得很短时，长回复会被中途放开。
+    eventSource.on('generation_started', () => addHold('tavern-generation'));
+    for (const name of ['generation_ended', 'generation_stopped']) {
+        eventSource.on(name, () => {
+            removeHold('tavern-generation');
+            armIdleTimer();
+        });
+    }
+
+    generationBound = true;
+}
+
+function installPublicApi() {
+    if (publicApiInstalled) {
+        return;
+    }
+
+    globalThis.SillyDroidScreenAwake = {
+        /** 其它插件可以显式按住屏幕常亮，直到 release。 */
+        hold: (reason = 'external') => {
+            addHold(`external:${reason}`);
+            return hasHeldWork();
+        },
+        release: (reason = 'external') => {
+            removeHold(`external:${reason}`);
+            armIdleTimer();
+            return hasHeldWork();
+        },
+        isHeld: () => hasHeldWork(),
+        isNovelTaskRunning,
+        wake: () => {
+            asleep = false;
+            noteActivity();
+        },
+    };
+
+    publicApiInstalled = true;
+}
+
+function uninstallPublicApi() {
+    if (publicApiInstalled) {
+        delete globalThis.SillyDroidScreenAwake;
+        publicApiInstalled = false;
+    }
+}
+
 function renderDiagnostics() {
     const node = document.getElementById(diagnosticsId);
     if (!node) {
@@ -82,7 +383,10 @@ function renderDiagnostics() {
     }
 
     const mark = (ok) => (ok ? '✓' : '✗');
-    node.textContent = `环境自检：安全上下文 ${mark(isSecure())} · 唤醒锁 ${mark(isWakeLockSupported())} · 视频保活 ${mark(isVideoFallbackSupported())}`;
+    const novelStatus = novelTaskRunning
+        ? '运行中'
+        : (document.getElementById(NOVEL_STATUS_ELEMENT_ID) ? '空闲' : '未检测到');
+    node.textContent = `环境自检：安全上下文 ${mark(isSecure())} · 唤醒锁 ${mark(isWakeLockSupported())} · 视频保活 ${mark(isVideoFallbackSupported())} · 任务 ${novelStatus}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +410,7 @@ function scheduleWakeLockRetry(settings) {
     retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
     retryTimer = setTimeout(() => {
         retryTimer = null;
-        if (!extensionActive || !settings.enabled || document.visibilityState !== 'visible') {
+        if (!extensionActive || !settings.enabled || asleep || document.visibilityState !== 'visible') {
             return;
         }
         void engage(settings);
@@ -142,6 +446,9 @@ function onWakeLockReleased(sentinel, settings) {
 
     if (!settings.enabled) {
         setStatus('屏幕常亮已关闭。', 'off');
+    } else if (asleep) {
+        // 主动休眠时由 sleepNow() 负责文案，避免被「已关闭」覆盖。
+        return;
     } else if (document.visibilityState !== 'visible') {
         setStatus('酒馆在后台，屏幕常亮已暂停。返回酒馆后会自动恢复。', 'paused');
     } else {
@@ -171,7 +478,7 @@ async function tryWakeLock(settings) {
     wakeLockRequest = (async () => {
         try {
             const sentinel = await navigator.wakeLock.request('screen');
-            if (!extensionActive || !settings.enabled || document.visibilityState !== 'visible') {
+            if (!extensionActive || !settings.enabled || asleep || document.visibilityState !== 'visible') {
                 await sentinel.release();
                 return;
             }
@@ -367,7 +674,7 @@ function destroyKeepAwakeVideo() {
 // ---------------------------------------------------------------------------
 
 async function engage(settings) {
-    if (!extensionActive || !settings.enabled) {
+    if (!extensionActive || !settings.enabled || asleep) {
         return;
     }
 
@@ -381,14 +688,18 @@ async function engage(settings) {
             destroyKeepAwakeVideo();
         }
         setMode(MODE_WAKE_LOCK);
-        setStatus('屏幕常亮已开启（系统唤醒锁）。酒馆页面保持前台时不会自动关屏。', 'active');
+        setStatus(hasHeldWork()
+            ? '屏幕常亮已开启 · 正在守护进行中的任务，任务结束前不会自动放开。'
+            : '屏幕常亮已开启（系统唤醒锁）。酒馆页面保持前台时不会自动关屏。', 'active');
         renderDiagnostics();
         return;
     }
 
     if (await startKeepAwakeVideo()) {
         setMode(MODE_VIDEO);
-        setStatus('屏幕常亮已开启（视频保活）。未能使用系统唤醒锁，改用静音循环视频让系统认为正在播放视频。', 'active');
+        setStatus(hasHeldWork()
+            ? '屏幕常亮已开启（视频保活）· 正在守护进行中的任务。'
+            : '屏幕常亮已开启（视频保活）。未能使用系统唤醒锁，改用静音循环视频让系统认为正在播放视频。', 'active');
         renderDiagnostics();
         return;
     }
@@ -401,6 +712,19 @@ async function engage(settings) {
 // ---------------------------------------------------------------------------
 // 界面与生命周期
 // ---------------------------------------------------------------------------
+
+function readIdleMinutes(settings) {
+    const minutes = clampIdle(settings.idleTimeoutMinutes);
+    return minutes;
+}
+
+function clampIdle(value) {
+    const minutes = Number(value);
+    if (!Number.isFinite(minutes) || minutes < 0) {
+        return defaults.idleTimeoutMinutes;
+    }
+    return Math.min(MAX_IDLE_MINUTES, Math.round(minutes * 100) / 100);
+}
 
 function mountExtension() {
     if (document.getElementById(panelId)) {
@@ -428,9 +752,22 @@ function mountExtension() {
                 <input id="${checkboxId}" type="checkbox" />
                 <span>保持屏幕常亮</span>
             </label>
+            <div class="sillydroid-screen-awake-row">
+                <label for="${dimSliderId}">页面压暗</label>
+                <input id="${dimSliderId}" type="range" min="0" max="${MAX_DIM_PERCENT}" step="5" />
+                <output id="${dimValueId}">0%</output>
+            </div>
+            <div class="sillydroid-screen-awake-row">
+                <label for="${idleInputId}">无操作自动放开（分钟，0=不放开）</label>
+                <input id="${idleInputId}" type="number" min="0" max="${MAX_IDLE_MINUTES}" step="1" />
+            </div>
+            <label class="checkbox_label sillydroid-screen-awake-toggle" for="${guardCheckboxId}">
+                <input id="${guardCheckboxId}" type="checkbox" />
+                <span>与小说自动生成器联动（任务运行期间不放开）</span>
+            </label>
             <p class="sillydroid-screen-awake-description">
                 仅在酒馆页面位于前台时阻止屏幕自动关闭。优先使用系统屏幕唤醒锁；不支持时退回静音循环视频保活。
-                不播放声音，也不改变酒馆的生成、消息和网络请求。
+                检测到小说生成任务运行时不会自动放开，任务结束或中断后立即释放；不播放声音，也不改变酒馆的生成逻辑。
             </p>
             <p id="${statusId}" class="sillydroid-screen-awake-status" role="status" aria-live="polite"></p>
             <p id="${diagnosticsId}" class="sillydroid-screen-awake-diagnostics"></p>
@@ -444,8 +781,11 @@ function mountExtension() {
         context.saveSettingsDebounced();
 
         if (settings.enabled) {
+            asleep = false;
             await engage(settings);
+            armIdleTimer();
         } else {
+            clearIdleTimer();
             pauseKeepAwakeVideo();
             destroyKeepAwakeVideo();
             await releaseWakeLock();
@@ -454,12 +794,63 @@ function mountExtension() {
         }
     });
 
+    const dimSlider = document.getElementById(dimSliderId);
+    dimSlider.value = String(clampDim(settings.dimLevel));
+    dimSlider.addEventListener('input', () => {
+        settings.dimLevel = clampDim(dimSlider.value);
+        context.saveSettingsDebounced();
+        applyDim(settings.dimLevel);
+    });
+
+    const idleInput = document.getElementById(idleInputId);
+    idleInput.value = String(clampIdle(settings.idleTimeoutMinutes));
+    idleInput.addEventListener('change', () => {
+        settings.idleTimeoutMinutes = clampIdle(idleInput.value);
+        idleInput.value = String(settings.idleTimeoutMinutes);
+        context.saveSettingsDebounced();
+        armIdleTimer();
+    });
+
+    const guardCheckbox = document.getElementById(guardCheckboxId);
+    guardCheckbox.checked = settings.guardNovelTask !== false;
+    guardCheckbox.addEventListener('change', () => {
+        settings.guardNovelTask = guardCheckbox.checked;
+        context.saveSettingsDebounced();
+        if (!guardCheckbox.checked) {
+            removeHold('novel-task');
+            novelTaskRunning = false;
+            armIdleTimer();
+            renderDiagnostics();
+        } else {
+            pollNovelTask();
+        }
+    });
+
+    applyDim(settings.dimLevel);
     renderDiagnostics();
+    installPublicApi();
+    bindGenerationEvents();
+    startNovelTaskPolling();
 
     if (settings.enabled) {
         void engage(settings);
+        armIdleTimer();
     } else {
         setStatus('默认关闭。开启后，屏幕只在酒馆页面前台时保持常亮。', 'off');
+    }
+
+    if (!activityHandlers) {
+        const onActivity = () => noteActivity();
+        activityHandlers = {
+            pointerdown: onActivity,
+            keydown: onActivity,
+            wheel: onActivity,
+            touchstart: onActivity,
+            scroll: onActivity,
+        };
+        for (const [type, handler] of Object.entries(activityHandlers)) {
+            document.addEventListener(type, handler, { passive: true, capture: true });
+        }
     }
 
     visibilityChangeHandler = () => {
@@ -469,6 +860,8 @@ function mountExtension() {
 
         if (document.visibilityState === 'visible') {
             if (settings.enabled) {
+                asleep = false;
+                noteActivity();
                 void engage(settings);
             }
             return;
@@ -502,7 +895,7 @@ function initializeExtension() {
     if (!pageShowHandler) {
         pageShowHandler = () => {
             initializeExtension();
-            if (activeSettings?.enabled) {
+            if (activeSettings?.enabled && !asleep) {
                 void engage(activeSettings);
             }
         };
@@ -564,6 +957,13 @@ export function disable() {
         visibilityChangeHandler = null;
     }
 
+    if (activityHandlers) {
+        for (const [type, handler] of Object.entries(activityHandlers)) {
+            document.removeEventListener(type, handler, { capture: true });
+        }
+        activityHandlers = null;
+    }
+
     if (pageHideHandler) {
         window.removeEventListener('pagehide', pageHideHandler);
         pageHideHandler = null;
@@ -573,6 +973,13 @@ export function disable() {
         pageShowHandler = null;
     }
 
+    stopNovelTaskPolling();
+    clearIdleTimer();
+    holds.clear();
+    novelTaskRunning = false;
+    asleep = false;
+    uninstallPublicApi();
+    removeDim();
     destroyKeepAwakeVideo();
     void releaseWakeLock();
     activeSettings = null;
