@@ -25,6 +25,10 @@ const NOVEL_STATUS_ELEMENT_ID = 'nag-status';
 const TASK_POLL_INTERVAL_MS = 2000;
 const TASK_END_GRACE_MS = 60000;
 const GENERATION_HOLD_TTL_MS = 20 * 60000;
+// 对账层：事件丢了也能收敛回来的周期（最后一层筛子）
+const RECONCILE_INTERVAL_MS = 5000;
+// 保活申请连续失败时的冷却，避免对账层每 5 秒重试一次录像
+const ENGAGE_FAILURE_COOLDOWN_MS = 30000;
 const MAX_DIM_PERCENT = 80;
 const MAX_IDLE_MINUTES = 600;
 
@@ -52,6 +56,8 @@ let asleep = false;
 let novelTaskRunning = false;
 let generationBound = false;
 let publicApiInstalled = false;
+let reconcileTimer = null;
+let lastEngageFailedAt = 0;
 const holds = new Set();
 const holdSince = new Map();
 const maxRetryDelay = 60000;
@@ -728,6 +734,7 @@ async function engage(settings) {
     }
 
     if (await tryWakeLock(settings)) {
+        lastEngageFailedAt = 0;
         if (keepAwakeVideo) {
             destroyKeepAwakeVideo();
         }
@@ -740,6 +747,7 @@ async function engage(settings) {
     }
 
     if (await startKeepAwakeVideo()) {
+        lastEngageFailedAt = 0;
         setMode(MODE_VIDEO);
         setStatus(hasHeldWork()
             ? '屏幕常亮已开启（视频保活）· 正在守护进行中的任务。'
@@ -748,9 +756,92 @@ async function engage(settings) {
         return;
     }
 
+    lastEngageFailedAt = Date.now();
     setMode(MODE_NONE);
     setStatus('当前浏览器既没有屏幕唤醒锁，也无法播放保活视频，屏幕仍会按系统设置关闭。', 'unsupported');
     renderDiagnostics();
+}
+
+// ---------------------------------------------------------------------------
+// 最后一层筛子：对账/自愈
+//
+// 上面所有判断都是事件驱动的，事件丢了（visibilitychange 没来、锁被悄悄回收、
+// 计时器没被武装）就会停在错误状态。这一层每 5 秒重算一次「应该保活吗」，
+// 与「实际在保活吗」比对，不一致就纠正——不依赖任何单个事件。
+// ---------------------------------------------------------------------------
+
+function wantsKeepAwake() {
+    return extensionActive
+        && activeSettings?.enabled === true
+        && document.visibilityState === 'visible'
+        && !asleep;
+}
+
+function isKeepingAwake() {
+    if (keepAwakeVideo && !keepAwakeVideo.paused) {
+        return true;
+    }
+    return Boolean(wakeLockSentinel && !wakeLockSentinel.released);
+}
+
+function needsIdleTimer() {
+    const minutes = Number(activeSettings?.idleTimeoutMinutes);
+    return extensionActive
+        && activeSettings?.enabled === true
+        && !asleep
+        && !hasHeldWork()
+        && Number.isFinite(minutes)
+        && minutes > 0;
+}
+
+function reconcile() {
+    if (!extensionActive || !activeSettings) {
+        return;
+    }
+
+    pruneStaleHolds();
+
+    const want = wantsKeepAwake();
+    const have = isKeepingAwake();
+
+    if (want && !have) {
+        if (Date.now() - lastEngageFailedAt < ENGAGE_FAILURE_COOLDOWN_MS) {
+            return;
+        }
+        console.warn(`[${extensionId}] reconciler: 期望保活但实际没有，重新申请`);
+        void engage(activeSettings);
+    } else if (!want && have) {
+        // 例如总开关被关掉、页面已隐藏，但对应事件没到。
+        pauseKeepAwakeVideo();
+        void releaseWakeLock();
+        setMode(MODE_NONE);
+        return;
+    }
+
+    // 计时器兜底：本该在计数却没有计时器（例如唤醒时漏了武装），补一个。
+    if (needsIdleTimer() && idleTimer === null) {
+        armIdleTimer();
+    }
+}
+
+function startReconcile() {
+    if (reconcileTimer !== null) {
+        return;
+    }
+    reconcileTimer = setInterval(() => {
+        try {
+            reconcile();
+        } catch (error) {
+            console.warn(`[${extensionId}] reconciler failed`, error);
+        }
+    }, RECONCILE_INTERVAL_MS);
+}
+
+function stopReconcile() {
+    if (reconcileTimer !== null) {
+        clearInterval(reconcileTimer);
+        reconcileTimer = null;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -870,6 +961,7 @@ function mountExtension() {
     installPublicApi();
     bindGenerationEvents();
     startNovelTaskPolling();
+    startReconcile();
 
     if (settings.enabled) {
         void engage(settings);
@@ -1013,7 +1105,9 @@ export function disable() {
     }
 
     stopNovelTaskPolling();
+    stopReconcile();
     clearIdleTimer();
+    lastEngageFailedAt = 0;
     holds.clear();
     novelTaskRunning = false;
     asleep = false;
