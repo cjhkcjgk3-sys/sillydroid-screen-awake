@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "minimum": {
+    "sillytavern": null,
+    "tavernHelper": null
+  },
+  "requirements": [
+    {
+      "id": "sillytavern-context",
+      "owner": "sillytavern",
+      "symbol": "SillyTavern.getContext",
+      "required": true,
+      "fallback": null
+    },
+    {
+      "id": "screen-wake-lock",
+      "owner": "provider",
+      "symbol": "navigator.wakeLock.request('screen')",
+      "required": false,
+      "fallback": "显示当前浏览器不支持或无法申请屏幕唤醒锁，常亮保持关闭。"
+    }
+  ]
+}

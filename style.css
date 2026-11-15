@@ -1,0 +1,30 @@
+.sillydroid-screen-awake-panel {
+    margin: 0.5em 0;
+}
+
+.sillydroid-screen-awake-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.6em;
+    margin: 0.5em 0;
+}
+
+.sillydroid-screen-awake-description,
+.sillydroid-screen-awake-status {
+    margin: 0.5em 0;
+    font-size: 0.9em;
+    line-height: 1.45;
+    opacity: 0.82;
+}
+
+.sillydroid-screen-awake-status[data-state='active'] {
+    color: var(--SmartThemeQuoteColor, #8fb8a7);
+    opacity: 1;
+}
+
+.sillydroid-screen-awake-status[data-state='error'],
+.sillydroid-screen-awake-status[data-state='unsupported'],
+.sillydroid-screen-awake-status[data-state='warning'] {
+    color: var(--SmartThemeEmColor, #e0a070);
+    opacity: 1;
+}

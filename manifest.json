@@ -1,0 +1,13 @@
+{
+  "display_name": "屏幕常亮",
+  "loading_order": 100,
+  "version": "1.0.0",
+  "author": "cjhkcjgk3-sys",
+  "js": "index.js",
+  "css": "style.css",
+  "homePage": "https://github.com/cjhkcjgk3-sys/sillydroid-screen-awake",
+  "hooks": {
+    "enable": "enable",
+    "disable": "disable"
+  }
+}
