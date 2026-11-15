@@ -24,6 +24,7 @@ const MODE_VIDEO = 'video';
 const NOVEL_STATUS_ELEMENT_ID = 'nag-status';
 const TASK_POLL_INTERVAL_MS = 2000;
 const TASK_END_GRACE_MS = 60000;
+const GENERATION_HOLD_TTL_MS = 20 * 60000;
 const MAX_DIM_PERCENT = 80;
 const MAX_IDLE_MINUTES = 600;
 
@@ -52,6 +53,7 @@ let novelTaskRunning = false;
 let generationBound = false;
 let publicApiInstalled = false;
 const holds = new Set();
+const holdSince = new Map();
 const maxRetryDelay = 60000;
 
 function getExtensionSettings() {
@@ -176,11 +178,33 @@ function addHold(reason) {
     }
 
     holds.add(reason);
+    holdSince.set(reason, Date.now());
     clearIdleTimer();
 }
 
 function removeHold(reason) {
     holds.delete(reason);
+    holdSince.delete(reason);
+}
+
+/**
+ * 酒馆的 generation_started 万一没有配对的 ended/stopped（请求挂死、页面异常），
+ * 守护会一直挂住。这里给「酒馆生成」这一个 hold 加 TTL；
+ * 小说任务的 hold 不加，它可以合法地跑几小时。
+ */
+function pruneStaleHolds() {
+    if (!holds.has('tavern-generation')) {
+        return;
+    }
+
+    const since = holdSince.get('tavern-generation') ?? 0;
+    if (Date.now() - since < GENERATION_HOLD_TTL_MS) {
+        return;
+    }
+
+    console.warn(`[${extensionId}] generation hold expired after TTL, releasing`);
+    removeHold('tavern-generation');
+    armIdleTimer();
 }
 
 function formatMinutes(minutes) {
@@ -244,9 +268,10 @@ function noteActivity() {
         if (extensionActive && activeSettings?.enabled) {
             void engage(activeSettings);
         }
-        return;
     }
 
+    // 无论刚才是唤醒还是常规活动，都要重新起表——否则「点一下屏幕」之后
+    // 计时器不会被重新武装，屏幕会一直亮到下一次活动为止。
     armIdleTimer();
 }
 
@@ -278,6 +303,8 @@ function pollNovelTask() {
         return;
     }
 
+    pruneStaleHolds();
+
     const guarded = settings.guardNovelTask !== false;
     const running = guarded && isNovelTaskRunning();
 
@@ -291,9 +318,12 @@ function pollNovelTask() {
         asleep = false;
         addHold('novel-task');
         noteActivity();
-        if (activeSettings?.enabled) {
-            void engage(activeSettings);
+        if (!settings.enabled) {
+            // 总开关关着时只记录状态，不改文案：否则会出现「已关闭」被覆盖成「已开启」。
+            renderDiagnostics();
+            return;
         }
+        void engage(settings);
         setStatus('屏幕常亮已开启 · 正在守护小说生成任务（任务结束前不会自动放开）。', 'active');
         renderDiagnostics();
         return;
@@ -301,22 +331,36 @@ function pollNovelTask() {
 
     removeHold('novel-task');
 
-    if (!extensionActive) {
+    if (!extensionActive || !settings.enabled) {
+        renderDiagnostics();
         return;
     }
 
-    if (!activeSettings?.enabled) {
-        return;
-    }
-
-    if (Date.now() - lastActivityAt > TASK_END_GRACE_MS) {
+    if (isNovelTaskPaused()) {
+        // 暂停 = 不产生网络请求，没必要继续烧屏幕；恢复任务时轮询会自动唤醒。
+        armIdleTimer();
+        setStatus(`小说任务已暂停，屏幕常亮仍开启（${idleHint()}，继续任务会自动恢复守护）。`, 'active');
+    } else if (Date.now() - lastActivityAt > TASK_END_GRACE_MS) {
         sleepNow('task-ended');
     } else {
         armIdleTimer();
-        setStatus(`小说生成任务已结束，屏幕常亮仍开启（${formatMinutes(activeSettings.idleTimeoutMinutes)}无操作后自动放开）。`, 'active');
+        setStatus(`小说生成任务已结束，屏幕常亮仍开启（${idleHint()}）。`, 'active');
     }
 
     renderDiagnostics();
+}
+
+function isNovelTaskPaused() {
+    const node = document.getElementById(NOVEL_STATUS_ELEMENT_ID);
+    return node?.classList?.contains?.('paused') === true;
+}
+
+function idleHint() {
+    const minutes = Number(activeSettings?.idleTimeoutMinutes);
+    if (!Number.isFinite(minutes) || minutes <= 0) {
+        return '不会自动放开';
+    }
+    return `${formatMinutes(minutes)}无操作后自动放开`;
 }
 
 function bindGenerationEvents() {
@@ -712,11 +756,6 @@ async function engage(settings) {
 // ---------------------------------------------------------------------------
 // 界面与生命周期
 // ---------------------------------------------------------------------------
-
-function readIdleMinutes(settings) {
-    const minutes = clampIdle(settings.idleTimeoutMinutes);
-    return minutes;
-}
 
 function clampIdle(value) {
     const minutes = Number(value);
