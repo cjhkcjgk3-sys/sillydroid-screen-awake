@@ -32,6 +32,13 @@
       "symbol": "#nag-status.running (Novel-Auto-Generator)",
       "required": false,
       "fallback": "联动失效时按普通空闲策略计时；该插件也可改用 globalThis.SillyDroidScreenAwake.hold/release 显式联动。"
+    },
+    {
+      "id": "task-silent-audio",
+      "owner": "provider",
+      "symbol": "HTMLAudioElement.play + Blob URL (PCM WAV)",
+      "required": false,
+      "fallback": "静音音频不可用时保留任务视频；后台执行效果需在目标 APP 实测。"
     }
   ]
 }
