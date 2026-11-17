@@ -9,6 +9,8 @@ const dimValueId = 'sillydroid-screen-awake-dim-value';
 const idleInputId = 'sillydroid-screen-awake-idle';
 const guardCheckboxId = 'sillydroid-screen-awake-guard';
 const audioCheckboxId = 'sillydroid-screen-awake-audio';
+const antiSilenceCheckboxId = 'sillydroid-screen-awake-anti-silence';
+const mediaSessionCheckboxId = 'sillydroid-screen-awake-media-session';
 const backgroundCheckboxId = 'sillydroid-screen-awake-background';
 
 const defaults = {
@@ -18,6 +20,8 @@ const defaults = {
     guardNovelTask: true,
     backgroundTaskVideo: true,
     taskSilentAudio: true,
+    antiSilenceNoise: true,
+    taskMediaSession: true,
 };
 
 const MODE_NONE = 'none';
@@ -69,6 +73,7 @@ let audioPlayPending = false;
 let lastAudioError = '';
 let lastAudioAttemptAt = 0;
 let publicApiInstalled = false;
+let mediaSessionActive = false;
 let reconcileTimer = null;
 let lastEngageFailedAt = 0;
 const holds = new Set();
@@ -443,6 +448,7 @@ function installPublicApi() {
             lastVideoError,
             audioPaused: taskAudio?.paused ?? true,
             lastAudioError,
+            mediaSessionActive,
         }),
         wake: () => {
             asleep = false;
@@ -620,6 +626,7 @@ async function createKeepAwakeClipUrl() {
 
     if (!mimeType) {
         stream.getTracks().forEach((track) => track.stop());
+        lastVideoError = '不支持 WebM 录制';
         return null;
     }
 
@@ -763,16 +770,78 @@ async function startKeepAwakeVideo() {
 }
 
 // A local PCM WAV with an actual audio track. No microphone or network access.
+function syncMediaSession(active) {
+    const ms = navigator?.mediaSession;
+    if (!ms) {
+        mediaSessionActive = false;
+        return;
+    }
+
+    const shouldEnable = Boolean(active && activeSettings?.taskMediaSession !== false);
+    if (!shouldEnable) {
+        if (mediaSessionActive) {
+            try {
+                ms.playbackState = 'none';
+                ms.metadata = null;
+                for (const action of ['play', 'pause', 'stop']) {
+                    ms.setActionHandler?.(action, null);
+                }
+            } catch {
+                // Ignore cleanup errors on restricted WebViews.
+            }
+            mediaSessionActive = false;
+        }
+        return;
+    }
+
+    try {
+        if (typeof globalThis.MediaMetadata === 'function' && !ms.metadata) {
+            ms.metadata = new globalThis.MediaMetadata({
+                title: '酒馆后台任务守护中',
+                artist: 'SillyTavern',
+                album: 'Screen Awake',
+            });
+        }
+        ms.playbackState = 'playing';
+        ms.setActionHandler?.('play', () => {
+            if (extensionActive && activeSettings?.enabled) {
+                lastAudioAttemptAt = 0;
+                void engage(activeSettings);
+            }
+        });
+        ms.setActionHandler?.('pause', () => {
+            pauseKeepAwakeVideo();
+            stopTaskAudio();
+            syncMediaSession(false);
+            renderDiagnostics();
+        });
+        ms.setActionHandler?.('stop', () => {
+            pauseKeepAwakeVideo();
+            stopTaskAudio();
+            syncMediaSession(false);
+            renderDiagnostics();
+        });
+        mediaSessionActive = true;
+    } catch {
+        mediaSessionActive = false;
+    }
+}
+
 function syncTaskAudio() {
     if (!wantsTaskVideo() || activeSettings.taskSilentAudio === false) {
         stopTaskAudio();
+        syncMediaSession(wantsTaskVideo() && keepAwakeVideo && !keepAwakeVideo.paused);
         return;
     }
-    if (audioPlayPending || (taskAudio && !taskAudio.paused)) return;
+    if (audioPlayPending || (taskAudio && !taskAudio.paused)) {
+        syncMediaSession(true);
+        return;
+    }
     if (Date.now() - lastAudioAttemptAt < ENGAGE_FAILURE_COOLDOWN_MS) return;
     lastAudioAttemptAt = Date.now();
     if (!taskAudio) {
-        const bytes = new Uint8Array(44 + 8000 * 2);
+        const sampleCount = 8000;
+        const bytes = new Uint8Array(44 + sampleCount * 2);
         const view = new DataView(bytes.buffer);
         const write = (offset, text) => [...text].forEach((c, i) => view.setUint8(offset + i, c.charCodeAt(0)));
         write(0, 'RIFF'); view.setUint32(4, bytes.length - 8, true);
@@ -781,6 +850,12 @@ function syncTaskAudio() {
         view.setUint32(24, 8000, true); view.setUint32(28, 16000, true);
         view.setUint16(32, 2, true); view.setUint16(34, 16, true);
         write(36, 'data'); view.setUint32(40, bytes.length - 44, true);
+        if (activeSettings?.antiSilenceNoise !== false) {
+            // 写入极微弱（±1 LSB，约 -90 dBFS）伪静音信号，避免全零 PCM 被音频管线判定为无声。
+            for (let i = 0; i < sampleCount; i++) {
+                view.setInt16(44 + i * 2, i % 2 === 0 ? 1 : -1, true);
+            }
+        }
         taskAudioUrl = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
         taskAudio = document.createElement('audio');
         taskAudio.loop = true;
@@ -793,8 +868,10 @@ function syncTaskAudio() {
     Promise.resolve().then(() => audio.play()).then(() => {
         if (taskAudio !== audio || !wantsTaskVideo() || activeSettings?.taskSilentAudio === false) {
             audio.pause();
+            syncMediaSession(false);
         } else {
             lastAudioError = '';
+            syncMediaSession(true);
         }
     }).catch(error => {
         if (taskAudio === audio) lastAudioError = error?.name ?? '播放失败';
@@ -816,6 +893,7 @@ function stopTaskAudio() {
     taskAudioUrl = null;
     audioPlayPending = false;
     lastAudioAttemptAt = 0;
+    syncMediaSession(false);
 }
 
 function pauseKeepAwakeVideo() {
@@ -1057,6 +1135,14 @@ function mountExtension() {
                 <input id="${audioCheckboxId}" type="checkbox" />
                 <span>同时播放静音音频辅助保活</span>
             </label>
+            <label class="checkbox_label sillydroid-screen-awake-toggle" for="${antiSilenceCheckboxId}">
+                <input id="${antiSilenceCheckboxId}" type="checkbox" />
+                <span>音频写入极微弱底噪（防系统静音检测）</span>
+            </label>
+            <label class="checkbox_label sillydroid-screen-awake-toggle" for="${mediaSessionCheckboxId}">
+                <input id="${mediaSessionCheckboxId}" type="checkbox" />
+                <span>注册 MediaSession 媒体会话（模拟音乐播放状态）</span>
+            </label>
             <p class="sillydroid-screen-awake-description">
                 任务开始时启动本地循环媒体，切后台后继续保留；整个任务完成、暂停或停止后释放。
                 暂时断网和重试期间继续守护。不同手机的后台运行效果需要实测；总开关可随时停止媒体。
@@ -1074,25 +1160,40 @@ function mountExtension() {
 
         if (settings.enabled) {
             asleep = false;
+            lastEngageFailedAt = 0;
             await engage(settings);
             armIdleTimer();
         } else {
             clearIdleTimer();
+            lastEngageFailedAt = 0;
             pauseKeepAwakeVideo();
             destroyKeepAwakeVideo();
             stopTaskAudio();
+            syncMediaSession(false);
             await releaseWakeLock();
             setMode(MODE_NONE);
             setStatus('屏幕常亮已关闭。', 'off');
+            renderDiagnostics();
         }
     });
 
-    for (const [id, key] of [[backgroundCheckboxId, 'backgroundTaskVideo'], [audioCheckboxId, 'taskSilentAudio']]) {
+    for (const [id, key] of [
+        [backgroundCheckboxId, 'backgroundTaskVideo'],
+        [audioCheckboxId, 'taskSilentAudio'],
+        [antiSilenceCheckboxId, 'antiSilenceNoise'],
+        [mediaSessionCheckboxId, 'taskMediaSession'],
+    ]) {
         const input = document.getElementById(id);
         input.checked = settings[key] !== false;
         input.addEventListener('change', () => {
             settings[key] = input.checked;
             context.saveSettingsDebounced();
+            if (key === 'antiSilenceNoise') {
+                stopTaskAudio();
+            }
+            if (key === 'taskMediaSession' && !input.checked) {
+                syncMediaSession(false);
+            }
             if (settings.enabled) void engage(settings);
             renderDiagnostics();
         });
@@ -1178,7 +1279,9 @@ function mountExtension() {
         } else {
             pauseKeepAwakeVideo();
             stopTaskAudio();
+            syncMediaSession(false);
             if (settings.enabled) setStatus('酒馆在后台，当前没有任务媒体守护。', 'paused');
+            renderDiagnostics();
         }
         void releaseWakeLock();
     };
@@ -1297,6 +1400,7 @@ export function disable() {
     removeDim();
     destroyKeepAwakeVideo();
     stopTaskAudio();
+    syncMediaSession(false);
     void releaseWakeLock();
     activeSettings = null;
     setMode(MODE_NONE);
