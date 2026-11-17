@@ -8,12 +8,16 @@ const dimSliderId = 'sillydroid-screen-awake-dim-slider';
 const dimValueId = 'sillydroid-screen-awake-dim-value';
 const idleInputId = 'sillydroid-screen-awake-idle';
 const guardCheckboxId = 'sillydroid-screen-awake-guard';
+const audioCheckboxId = 'sillydroid-screen-awake-audio';
+const backgroundCheckboxId = 'sillydroid-screen-awake-background';
 
 const defaults = {
     enabled: false,
     dimLevel: 0,
     idleTimeoutMinutes: 10,
     guardNovelTask: true,
+    backgroundTaskVideo: true,
+    taskSilentAudio: true,
 };
 
 const MODE_NONE = 'none';
@@ -24,7 +28,6 @@ const MODE_VIDEO = 'video';
 const NOVEL_STATUS_ELEMENT_ID = 'nag-status';
 const TASK_POLL_INTERVAL_MS = 2000;
 const TASK_END_GRACE_MS = 60000;
-const GENERATION_HOLD_TTL_MS = 20 * 60000;
 // 对账层：事件丢了也能收敛回来的周期（最后一层筛子）
 const RECONCILE_INTERVAL_MS = 5000;
 // 保活申请连续失败时的冷却，避免对账层每 5 秒重试一次录像
@@ -51,15 +54,24 @@ let keepAwakeClipUrl = null;
 let dimOverlay = null;
 let idleTimer = null;
 let taskPollTimer = null;
+let novelStatusObserver = null;
+let observedNovelStatus = null;
 let lastActivityAt = Date.now();
 let asleep = false;
 let novelTaskRunning = false;
-let generationBound = false;
+let generationSubscriptions = [];
+let mediaRevision = 0;
+let lastVideoError = '';
+let lastVideoProgressAt = 0;
+let taskAudio = null;
+let taskAudioUrl = null;
+let audioPlayPending = false;
+let lastAudioError = '';
+let lastAudioAttemptAt = 0;
 let publicApiInstalled = false;
 let reconcileTimer = null;
 let lastEngageFailedAt = 0;
 const holds = new Set();
-const holdSince = new Map();
 const maxRetryDelay = 60000;
 
 function getExtensionSettings() {
@@ -184,34 +196,21 @@ function addHold(reason) {
     }
 
     holds.add(reason);
-    holdSince.set(reason, Date.now());
     clearIdleTimer();
+    asleep = false;
+    if (activeSettings?.enabled) {
+        void engage(activeSettings);
+    }
 }
 
 function removeHold(reason) {
     holds.delete(reason);
-    holdSince.delete(reason);
+    if (extensionActive && activeSettings?.enabled) {
+        void engage(activeSettings);
+    }
 }
 
-/**
- * 酒馆的 generation_started 万一没有配对的 ended/stopped（请求挂死、页面异常），
- * 守护会一直挂住。这里给「酒馆生成」这一个 hold 加 TTL；
- * 小说任务的 hold 不加，它可以合法地跑几小时。
- */
-function pruneStaleHolds() {
-    if (!holds.has('tavern-generation')) {
-        return;
-    }
-
-    const since = holdSince.get('tavern-generation') ?? 0;
-    if (Date.now() - since < GENERATION_HOLD_TTL_MS) {
-        return;
-    }
-
-    console.warn(`[${extensionId}] generation hold expired after TTL, releasing`);
-    removeHold('tavern-generation');
-    armIdleTimer();
-}
+// Elapsed time and missing callbacks do not establish task failure.
 
 function formatMinutes(minutes) {
     const value = Number(minutes);
@@ -228,10 +227,14 @@ function sleepNow(reason) {
     if (!extensionActive) {
         return;
     }
+    if (hasHeldWork()) {
+        return;
+    }
 
     asleep = true;
     clearIdleTimer();
     pauseKeepAwakeVideo();
+    stopTaskAudio();
     void releaseWakeLock();
     setMode(MODE_NONE);
 
@@ -276,6 +279,11 @@ function noteActivity() {
         }
     }
 
+    if (wantsTaskVideo() && (!keepAwakeVideo || keepAwakeVideo.paused || taskAudio?.paused)) {
+        lastAudioAttemptAt = 0;
+        void engage(activeSettings);
+    }
+
     // 无论刚才是唤醒还是常规活动，都要重新起表——否则「点一下屏幕」之后
     // 计时器不会被重新武装，屏幕会一直亮到下一次活动为止。
     armIdleTimer();
@@ -297,6 +305,9 @@ function startNovelTaskPolling() {
 }
 
 function stopNovelTaskPolling() {
+    novelStatusObserver?.disconnect();
+    novelStatusObserver = null;
+    observedNovelStatus = null;
     if (taskPollTimer !== null) {
         clearInterval(taskPollTimer);
         taskPollTimer = null;
@@ -308,8 +319,14 @@ function pollNovelTask() {
     if (!settings) {
         return;
     }
+    const statusNode = document.getElementById(NOVEL_STATUS_ELEMENT_ID);
+    if (statusNode !== observedNovelStatus) {
+        novelStatusObserver?.disconnect();
+        observedNovelStatus = statusNode;
+        novelStatusObserver = statusNode ? new MutationObserver(pollNovelTask) : null;
+        novelStatusObserver?.observe(statusNode, { attributes: true, attributeFilter: ['class'] });
+    }
 
-    pruneStaleHolds();
 
     const guarded = settings.guardNovelTask !== false;
     const running = guarded && isNovelTaskRunning();
@@ -370,7 +387,7 @@ function idleHint() {
 }
 
 function bindGenerationEvents() {
-    if (generationBound) {
+    if (generationSubscriptions.length) {
         return;
     }
 
@@ -381,15 +398,21 @@ function bindGenerationEvents() {
     }
 
     // 酒馆自身生成期间也视为「有活要干」：否则把自定义时长设得很短时，长回复会被中途放开。
-    eventSource.on('generation_started', () => addHold('tavern-generation'));
+    const subscribe = (name, handler) => {
+        eventSource.on(name, handler);
+        generationSubscriptions.push(() => eventSource.removeListener(name, handler));
+    };
+    if (typeof eventSource.removeListener !== 'function') {
+        return;
+    }
+    subscribe('generation_started', () => addHold('tavern-generation'));
     for (const name of ['generation_ended', 'generation_stopped']) {
-        eventSource.on(name, () => {
+        subscribe(name, () => {
             removeHold('tavern-generation');
             armIdleTimer();
         });
     }
 
-    generationBound = true;
 }
 
 function installPublicApi() {
@@ -410,6 +433,17 @@ function installPublicApi() {
         },
         isHeld: () => hasHeldWork(),
         isNovelTaskRunning,
+        getDiagnostics: () => ({
+            visibility: document.visibilityState,
+            holds: [...holds],
+            videoRequested: wantsTaskVideo(),
+            videoPaused: keepAwakeVideo?.paused ?? true,
+            videoTime: keepAwakeVideo?.currentTime ?? null,
+            lastVideoProgressAt,
+            lastVideoError,
+            audioPaused: taskAudio?.paused ?? true,
+            lastAudioError,
+        }),
         wake: () => {
             asleep = false;
             noteActivity();
@@ -436,7 +470,7 @@ function renderDiagnostics() {
     const novelStatus = novelTaskRunning
         ? '运行中'
         : (document.getElementById(NOVEL_STATUS_ELEMENT_ID) ? '空闲' : '未检测到');
-    node.textContent = `环境自检：安全上下文 ${mark(isSecure())} · 唤醒锁 ${mark(isWakeLockSupported())} · 视频保活 ${mark(isVideoFallbackSupported())} · 任务 ${novelStatus}`;
+    node.textContent = `环境自检：安全上下文 ${mark(isSecure())} · 唤醒锁 ${mark(isWakeLockSupported())} · 视频保活 ${mark(isVideoFallbackSupported())} · 任务 ${novelStatus} · 视频 ${keepAwakeVideo && !keepAwakeVideo.paused ? "播放中（后台效果待实测）" : "未播放"} · 音频 ${taskAudio && !taskAudio.paused ? "播放中" : "未播放"}${lastVideoError ? " · " + lastVideoError : ""}${lastAudioError ? " · 音频 " + lastAudioError : ""}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -500,7 +534,10 @@ function onWakeLockReleased(sentinel, settings) {
         // 主动休眠时由 sleepNow() 负责文案，避免被「已关闭」覆盖。
         return;
     } else if (document.visibilityState !== 'visible') {
-        setStatus('酒馆在后台，屏幕常亮已暂停。返回酒馆后会自动恢复。', 'paused');
+        // A screen lock release must not overwrite task-video status.
+        if (!wantsTaskVideo()) {
+            setStatus('酒馆在后台，屏幕常亮已暂停。返回酒馆后会自动恢复。', 'paused');
+        }
     } else {
         setStatus('系统收回了屏幕唤醒锁，正在重新申请…', 'pending');
         scheduleWakeLockRetry(settings);
@@ -558,7 +595,7 @@ async function tryWakeLock(settings) {
 // 浏览器把「正在播放带视频轨的媒体」当作正在放视频，从而申请显示常亮
 // （NoSleep.js 十余年来用的就是这套）。所以这里现场录制一段 16×16、
 // 无音频、循环播放的极小 WebM，贴着屏幕角落摆一个 2×2 像素的播放器。
-// 注意：纯音频（振荡器）在 Android 上不生效，必须有真实视频轨。
+// 此视频沿用前台防熄屏方案；后台任务另有可选静音音频辅助，效果依宿主而定。
 // ---------------------------------------------------------------------------
 
 async function createKeepAwakeClipUrl() {
@@ -604,7 +641,12 @@ async function createKeepAwakeClipUrl() {
         };
         recorder.onstop = () => finish(chunks.length ? new Blob(chunks, { type: mimeType }) : null);
         recorder.onerror = () => finish(null);
-        recorder.start();
+        try {
+            recorder.start();
+        } catch {
+            finish(null);
+            return;
+        }
         setTimeout(() => {
             try {
                 recorder.stop();
@@ -612,9 +654,7 @@ async function createKeepAwakeClipUrl() {
                 // Already stopped.
             }
         }, 300);
-    });
-
-    stream.getTracks().forEach((track) => track.stop());
+    }).finally(() => stream.getTracks().forEach((track) => track.stop()));
 
     if (!blob?.size) {
         return null;
@@ -628,10 +668,22 @@ async function createAndPlayKeepAwakeVideo() {
         return false;
     }
 
-    keepAwakeClipUrl = await createKeepAwakeClipUrl();
-    if (!keepAwakeClipUrl) {
+    const revision = mediaRevision;
+    let clipUrl;
+    try {
+        clipUrl = await createKeepAwakeClipUrl();
+    } catch (error) {
+        lastVideoError = error?.name ?? '视频创建失败';
         return false;
     }
+    if (!clipUrl) {
+        return false;
+    }
+    if (revision !== mediaRevision || !wantsVideo()) {
+        URL.revokeObjectURL(clipUrl);
+        return false;
+    }
+    keepAwakeClipUrl = clipUrl;
 
     const video = document.createElement('video');
     video.muted = true;
@@ -648,12 +700,27 @@ async function createAndPlayKeepAwakeVideo() {
     video.src = keepAwakeClipUrl;
     document.body.append(video);
     keepAwakeVideo = video;
+    video.addEventListener('timeupdate', () => {
+        if (keepAwakeVideo === video) lastVideoProgressAt = Date.now();
+    });
+    video.addEventListener('error', () => {
+        if (keepAwakeVideo === video) {
+            lastVideoError = `媒体错误 ${video.error?.code ?? 'unknown'}`;
+            renderDiagnostics();
+        }
+    });
 
     try {
         await video.play();
+        if (revision !== mediaRevision || !wantsVideo()) {
+            video.pause();
+            return false;
+        }
+        lastVideoError = '';
     } catch (error) {
+        lastVideoError = error?.name ?? '播放失败';
         console.debug(`[${extensionId}] keep-awake video could not play`, error);
-        destroyKeepAwakeVideo();
+        if (keepAwakeVideo === video) destroyKeepAwakeVideo();
         return false;
     }
 
@@ -661,19 +728,30 @@ async function createAndPlayKeepAwakeVideo() {
 }
 
 async function startKeepAwakeVideo() {
+    if (keepAwakeVideoRequest) {
+        return keepAwakeVideoRequest;
+    }
     if (keepAwakeVideo) {
+        const video = keepAwakeVideo;
+        const revision = mediaRevision;
+        if (video.error) {
+            destroyKeepAwakeVideo();
+            return false;
+        }
         if (keepAwakeVideo.paused) {
             try {
-                await keepAwakeVideo.play();
-            } catch {
+                await video.play();
+            } catch (error) {
+                lastVideoError = error?.name ?? '播放失败';
                 return false;
             }
         }
-        return !keepAwakeVideo.paused;
-    }
-
-    if (keepAwakeVideoRequest) {
-        return keepAwakeVideoRequest;
+        if (revision !== mediaRevision || !wantsVideo()) {
+            video.pause();
+            return false;
+        }
+        lastVideoError = '';
+        return keepAwakeVideo === video && !video.paused;
     }
 
     keepAwakeVideoRequest = createAndPlayKeepAwakeVideo();
@@ -684,7 +762,64 @@ async function startKeepAwakeVideo() {
     }
 }
 
+// A local PCM WAV with an actual audio track. No microphone or network access.
+function syncTaskAudio() {
+    if (!wantsTaskVideo() || activeSettings.taskSilentAudio === false) {
+        stopTaskAudio();
+        return;
+    }
+    if (audioPlayPending || (taskAudio && !taskAudio.paused)) return;
+    if (Date.now() - lastAudioAttemptAt < ENGAGE_FAILURE_COOLDOWN_MS) return;
+    lastAudioAttemptAt = Date.now();
+    if (!taskAudio) {
+        const bytes = new Uint8Array(44 + 8000 * 2);
+        const view = new DataView(bytes.buffer);
+        const write = (offset, text) => [...text].forEach((c, i) => view.setUint8(offset + i, c.charCodeAt(0)));
+        write(0, 'RIFF'); view.setUint32(4, bytes.length - 8, true);
+        write(8, 'WAVE'); write(12, 'fmt '); view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+        view.setUint32(24, 8000, true); view.setUint32(28, 16000, true);
+        view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+        write(36, 'data'); view.setUint32(40, bytes.length - 44, true);
+        taskAudioUrl = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
+        taskAudio = document.createElement('audio');
+        taskAudio.loop = true;
+        taskAudio.src = taskAudioUrl;
+        taskAudio.setAttribute('aria-hidden', 'true');
+        document.body.append(taskAudio);
+    }
+    const audio = taskAudio;
+    audioPlayPending = true;
+    Promise.resolve().then(() => audio.play()).then(() => {
+        if (taskAudio !== audio || !wantsTaskVideo() || activeSettings?.taskSilentAudio === false) {
+            audio.pause();
+        } else {
+            lastAudioError = '';
+        }
+    }).catch(error => {
+        if (taskAudio === audio) lastAudioError = error?.name ?? '播放失败';
+    }).finally(() => {
+        if (taskAudio === audio) audioPlayPending = false;
+        renderDiagnostics();
+    });
+}
+
+function stopTaskAudio() {
+    if (taskAudio) {
+        taskAudio.pause();
+        taskAudio.removeAttribute('src');
+        taskAudio.load();
+        taskAudio.remove();
+        taskAudio = null;
+    }
+    if (taskAudioUrl) URL.revokeObjectURL(taskAudioUrl);
+    taskAudioUrl = null;
+    audioPlayPending = false;
+    lastAudioAttemptAt = 0;
+}
+
 function pauseKeepAwakeVideo() {
+    mediaRevision++;
     if (!keepAwakeVideo) {
         return;
     }
@@ -697,6 +832,7 @@ function pauseKeepAwakeVideo() {
 }
 
 function destroyKeepAwakeVideo() {
+    mediaRevision++;
     if (keepAwakeVideo) {
         try {
             keepAwakeVideo.pause();
@@ -720,45 +856,64 @@ function destroyKeepAwakeVideo() {
 }
 
 // ---------------------------------------------------------------------------
-// 调度：先唤醒锁，不行再视频保活
+// 调度：任务媒体独立于前台屏幕唤醒锁
 // ---------------------------------------------------------------------------
 
+function wantsTaskVideo() {
+    return extensionActive && activeSettings?.enabled === true
+        && activeSettings.backgroundTaskVideo !== false && hasHeldWork();
+}
+
+function wantsVideo() {
+    return wantsTaskVideo() || wantsKeepAwake();
+}
+
 async function engage(settings) {
-    if (!extensionActive || !settings.enabled || asleep) {
-        return;
-    }
+    if (!extensionActive || !settings.enabled || asleep) return;
 
-    if (document.visibilityState !== 'visible') {
-        setStatus('酒馆在后台，屏幕常亮已暂停。返回酒馆后会自动恢复。', 'paused');
-        return;
-    }
-
-    if (await tryWakeLock(settings)) {
-        lastEngageFailedAt = 0;
-        if (keepAwakeVideo) {
-            destroyKeepAwakeVideo();
+    // Start media before awaiting the screen lock, while the page is still visible.
+    if (wantsTaskVideo()) {
+        syncTaskAudio();
+        const playing = await startKeepAwakeVideo();
+        if (!wantsTaskVideo()) return;
+        syncTaskAudio();
+        if (document.visibilityState === 'visible') {
+            await tryWakeLock(settings);
+        } else {
+            void releaseWakeLock();
         }
-        setMode(MODE_WAKE_LOCK);
-        setStatus(hasHeldWork()
-            ? '屏幕常亮已开启 · 正在守护进行中的任务，任务结束前不会自动放开。'
-            : '屏幕常亮已开启（系统唤醒锁）。酒馆页面保持前台时不会自动关屏。', 'active');
+        if (!wantsTaskVideo()) return;
+        lastEngageFailedAt = playing ? 0 : Date.now();
+        setMode(playing ? MODE_VIDEO : MODE_NONE);
+        setStatus(playing
+            ? '任务媒体已启动 · 切换后台时继续保留，实际后台运行效果请实测。'
+            : '任务媒体未能播放；任务仍保持守护，返回前台触摸后可重试。', playing ? 'active' : 'warning');
         renderDiagnostics();
         return;
     }
 
-    if (await startKeepAwakeVideo()) {
+    stopTaskAudio();
+    if (!wantsKeepAwake()) {
+        pauseKeepAwakeVideo();
+        void releaseWakeLock();
+        setMode(MODE_NONE);
+        setStatus('酒馆在后台，当前没有任务媒体守护。', 'paused');
+        return;
+    }
+    const locked = await tryWakeLock(settings);
+    if (!wantsKeepAwake() || wantsTaskVideo()) return;
+    if (locked) {
+        destroyKeepAwakeVideo();
         lastEngageFailedAt = 0;
-        setMode(MODE_VIDEO);
-        setStatus(hasHeldWork()
-            ? '屏幕常亮已开启（视频保活）· 正在守护进行中的任务。'
-            : '屏幕常亮已开启（视频保活）。未能使用系统唤醒锁，改用静音循环视频让系统认为正在播放视频。', 'active');
-        renderDiagnostics();
-        return;
+        setMode(MODE_WAKE_LOCK);
+        setStatus('屏幕常亮已开启（系统唤醒锁）。', 'active');
+    } else {
+        const playing = await startKeepAwakeVideo();
+        if (!wantsKeepAwake() || wantsTaskVideo()) return;
+        lastEngageFailedAt = playing ? 0 : Date.now();
+        setMode(playing ? MODE_VIDEO : MODE_NONE);
+        setStatus(playing ? '屏幕常亮已开启（静音视频）。' : '当前环境无法播放常亮视频。', playing ? 'active' : 'unsupported');
     }
-
-    lastEngageFailedAt = Date.now();
-    setMode(MODE_NONE);
-    setStatus('当前浏览器既没有屏幕唤醒锁，也无法播放保活视频，屏幕仍会按系统设置关闭。', 'unsupported');
     renderDiagnostics();
 }
 
@@ -799,24 +954,23 @@ function reconcile() {
         return;
     }
 
-    pruneStaleHolds();
-
-    const want = wantsKeepAwake();
-    const have = isKeepingAwake();
-
-    if (want && !have) {
-        if (Date.now() - lastEngageFailedAt < ENGAGE_FAILURE_COOLDOWN_MS) {
-            return;
-        }
-        console.warn(`[${extensionId}] reconciler: 期望保活但实际没有，重新申请`);
-        void engage(activeSettings);
-    } else if (!want && have) {
-        // 例如总开关被关掉、页面已隐藏，但对应事件没到。
+    if (!wantsKeepAwake() && !wantsTaskVideo()) {
         pauseKeepAwakeVideo();
+        stopTaskAudio();
         void releaseWakeLock();
         setMode(MODE_NONE);
-        return;
+    } else {
+        const videoNeeded = wantsTaskVideo();
+        const videoPlaying = keepAwakeVideo && !keepAwakeVideo.paused && !keepAwakeVideo.error;
+        if ((videoNeeded && !videoPlaying) || (!videoNeeded && !isKeepingAwake())) {
+            if (Date.now() - lastEngageFailedAt >= ENGAGE_FAILURE_COOLDOWN_MS) {
+                void engage(activeSettings);
+            }
+        }
+        if (videoNeeded) syncTaskAudio();
+        if (document.visibilityState !== 'visible') void releaseWakeLock();
     }
+    renderDiagnostics();
 
     // 计时器兜底：本该在计数却没有计时器（例如唤醒时漏了武装），补一个。
     if (needsIdleTimer() && idleTimer === null) {
@@ -895,9 +1049,17 @@ function mountExtension() {
                 <input id="${guardCheckboxId}" type="checkbox" />
                 <span>与小说自动生成器联动（任务运行期间不放开）</span>
             </label>
+            <label class="checkbox_label sillydroid-screen-awake-toggle" for="${backgroundCheckboxId}">
+                <input id="${backgroundCheckboxId}" type="checkbox" />
+                <span>任务期间持续播放视频（尝试保持后台运行）</span>
+            </label>
+            <label class="checkbox_label sillydroid-screen-awake-toggle" for="${audioCheckboxId}">
+                <input id="${audioCheckboxId}" type="checkbox" />
+                <span>同时播放静音音频辅助保活</span>
+            </label>
             <p class="sillydroid-screen-awake-description">
-                仅在酒馆页面位于前台时阻止屏幕自动关闭。优先使用系统屏幕唤醒锁；不支持时退回静音循环视频保活。
-                检测到小说生成任务运行时不会自动放开，任务结束或中断后立即释放；不播放声音，也不改变酒馆的生成逻辑。
+                任务开始时启动本地循环媒体，切后台后继续保留；整个任务完成、暂停或停止后释放。
+                暂时断网和重试期间继续守护。不同手机的后台运行效果需要实测；总开关可随时停止媒体。
             </p>
             <p id="${statusId}" class="sillydroid-screen-awake-status" role="status" aria-live="polite"></p>
             <p id="${diagnosticsId}" class="sillydroid-screen-awake-diagnostics"></p>
@@ -918,11 +1080,23 @@ function mountExtension() {
             clearIdleTimer();
             pauseKeepAwakeVideo();
             destroyKeepAwakeVideo();
+            stopTaskAudio();
             await releaseWakeLock();
             setMode(MODE_NONE);
             setStatus('屏幕常亮已关闭。', 'off');
         }
     });
+
+    for (const [id, key] of [[backgroundCheckboxId, 'backgroundTaskVideo'], [audioCheckboxId, 'taskSilentAudio']]) {
+        const input = document.getElementById(id);
+        input.checked = settings[key] !== false;
+        input.addEventListener('change', () => {
+            settings[key] = input.checked;
+            context.saveSettingsDebounced();
+            if (settings.enabled) void engage(settings);
+            renderDiagnostics();
+        });
+    }
 
     const dimSlider = document.getElementById(dimSliderId);
     dimSlider.value = String(clampDim(settings.dimLevel));
@@ -967,7 +1141,7 @@ function mountExtension() {
         void engage(settings);
         armIdleTimer();
     } else {
-        setStatus('默认关闭。开启后，屏幕只在酒馆页面前台时保持常亮。', 'off');
+        setStatus('默认关闭。开启后前台保持常亮，任务期间尝试持续播放后台媒体。', 'off');
     }
 
     if (!activityHandlers) {
@@ -998,9 +1172,13 @@ function mountExtension() {
             return;
         }
 
-        pauseKeepAwakeVideo();
-        if (settings.enabled) {
-            setStatus('酒馆在后台，屏幕常亮已暂停。返回酒馆后会自动恢复。', 'paused');
+        // Preserve existing media while hidden; no screen lock is requested here.
+        if (wantsTaskVideo()) {
+            void engage(settings);
+        } else {
+            pauseKeepAwakeVideo();
+            stopTaskAudio();
+            if (settings.enabled) setStatus('酒馆在后台，当前没有任务媒体守护。', 'paused');
         }
         void releaseWakeLock();
     };
@@ -1018,7 +1196,10 @@ function initializeExtension() {
         pageHideHandler = () => {
             mountObserver?.disconnect();
             mountObserver = null;
+            // A BFCache page must release resources; on pageshow it may resume.
+            // Ordinary APP backgrounding is handled by visibilitychange.
             pauseKeepAwakeVideo();
+            stopTaskAudio();
             void releaseWakeLock();
         };
         window.addEventListener('pagehide', pageHideHandler);
@@ -1104,6 +1285,7 @@ export function disable() {
         pageShowHandler = null;
     }
 
+    for (const unsubscribe of generationSubscriptions.splice(0)) unsubscribe();
     stopNovelTaskPolling();
     stopReconcile();
     clearIdleTimer();
@@ -1114,6 +1296,7 @@ export function disable() {
     uninstallPublicApi();
     removeDim();
     destroyKeepAwakeVideo();
+    stopTaskAudio();
     void releaseWakeLock();
     activeSettings = null;
     setMode(MODE_NONE);
@@ -1126,3 +1309,4 @@ if (document.readyState === 'loading') {
 } else {
     initializeExtension();
 }
+
